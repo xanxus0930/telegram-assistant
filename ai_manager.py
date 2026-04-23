@@ -1,11 +1,12 @@
 import asyncio
 import base64
+import json
 import os
 import tempfile
 from typing import Optional
 
+import aiohttp
 import google.generativeai as genai
-from openai import AsyncOpenAI, RateLimitError, APIStatusError
 
 import db
 from config import (
@@ -18,10 +19,6 @@ QUOTA_KEYWORDS = ["quota", "rate limit", "exhausted", "insufficient", "overloade
 
 
 def _is_quota_error(e: Exception) -> bool:
-    if isinstance(e, RateLimitError):
-        return True
-    if isinstance(e, APIStatusError) and e.status_code in (429, 503):
-        return True
     msg = str(e).lower()
     return any(kw in msg for kw in QUOTA_KEYWORDS)
 
@@ -31,28 +28,30 @@ class AIManager:
         if GOOGLE_API_KEY:
             genai.configure(api_key=GOOGLE_API_KEY)
 
-        self.clients: dict[str, AsyncOpenAI] = {}
+        # Provider configs for direct HTTP calls (no openai SDK needed)
+        self.provider_config = {}
         if NVIDIA_API_KEY:
-            self.clients["nvidia"] = AsyncOpenAI(
-                base_url=NVIDIA_BASE_URL,
-                api_key=NVIDIA_API_KEY,
-            )
+            self.provider_config["nvidia"] = {
+                "base_url": NVIDIA_BASE_URL,
+                "api_key": NVIDIA_API_KEY,
+                "headers": {},
+            }
         if OPENROUTER_API_KEY:
-            self.clients["openrouter"] = AsyncOpenAI(
-                base_url=OPENROUTER_BASE_URL,
-                api_key=OPENROUTER_API_KEY,
-                default_headers={
+            self.provider_config["openrouter"] = {
+                "base_url": OPENROUTER_BASE_URL,
+                "api_key": OPENROUTER_API_KEY,
+                "headers": {
                     "HTTP-Referer": "https://telegram-personal-assistant",
                     "X-Title": "Personal Assistant Bot",
                 },
-            )
+            }
 
     def available_providers(self) -> list[str]:
         result = []
         for p in PROVIDER_ORDER:
             if p == "gemini" and GOOGLE_API_KEY:
                 result.append(p)
-            elif p in self.clients:
+            elif p in self.provider_config:
                 result.append(p)
         return result
 
@@ -109,8 +108,7 @@ class AIManager:
     ) -> tuple[str, int]:
         if provider == "gemini":
             return await self._gemini(model, messages, system, image_bytes, image_mime)
-        client = self.clients[provider]
-        return await self._openai_compat(client, model, messages, system, image_bytes, image_mime)
+        return await self._openai_compat_http(provider, model, messages, system, image_bytes, image_mime)
 
     async def _gemini(
         self,
@@ -125,11 +123,9 @@ class AIManager:
             system_instruction=system if system else None,
         )
 
-        # Build history (all but last) - ensure alternating roles
         history = []
         for msg in messages[:-1]:
             role = "user" if msg["role"] == "user" else "model"
-            # Skip consecutive same-role messages to satisfy Gemini's requirement
             if history and history[-1]["role"] == role:
                 history[-1]["parts"][0] += "\n" + msg["content"]
             else:
@@ -151,15 +147,20 @@ class AIManager:
             tokens = response.usage_metadata.total_token_count or 0
         return response.text, tokens
 
-    async def _openai_compat(
+    async def _openai_compat_http(
         self,
-        client: AsyncOpenAI,
+        provider: str,
         model: str,
         messages: list[dict],
         system: str,
         image_bytes: Optional[bytes],
         image_mime: str,
     ) -> tuple[str, int]:
+        """Direct HTTP call to OpenAI-compatible APIs using aiohttp (no openai SDK)."""
+        cfg = self.provider_config[provider]
+        base_url = cfg["base_url"].rstrip("/")
+        url = f"{base_url}/chat/completions"
+
         formatted = []
         if system:
             formatted.append({"role": "system", "content": system})
@@ -178,16 +179,32 @@ class AIManager:
             else:
                 formatted.append({"role": msg["role"], "content": msg["content"]})
 
-        response = await client.chat.completions.create(
-            model=model,
-            messages=formatted,
-            max_tokens=2048,
-        )
-        tokens = response.usage.total_tokens if response.usage else 0
-        return response.choices[0].message.content or "", tokens
+        headers = {
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+            **cfg.get("headers", {}),
+        }
+        payload = {
+            "model": model,
+            "messages": formatted,
+            "max_tokens": 2048,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    if any(kw in text.lower() for kw in QUOTA_KEYWORDS):
+                        raise RuntimeError(f"quota error: {text[:200]}")
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                data = await resp.json()
+
+        content = data["choices"][0]["message"]["content"] or ""
+        tokens = data.get("usage", {}).get("total_tokens", 0)
+        return content, tokens
 
     async def transcribe(self, audio_path: str) -> str:
-        """Transcribe audio. Requires Google API key (Gemini handles audio natively)."""
+        """Transcribe audio using Gemini."""
         if not GOOGLE_API_KEY:
             raise RuntimeError("語音轉錄需要 Google API Key（Gemini 原生支援音訊）")
         return await asyncio.to_thread(self._gemini_transcribe_sync, audio_path)
