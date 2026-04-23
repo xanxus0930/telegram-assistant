@@ -7,6 +7,41 @@ import feedparser
 import pytz
 from bs4 import BeautifulSoup
 
+# ── Web Search (DuckDuckGo) ───────────────────────────────────────────────────
+
+SEARCH_KEYWORDS = [
+    # 時間性
+    "今天", "今日", "昨天", "現在", "最近", "最新", "剛才", "目前",
+    "today", "now", "latest", "current", "recent", "news",
+    # 價格行情
+    "價格", "多少錢", "幾塊", "漲", "跌", "行情", "匯率",
+    "price", "worth", "cost", "rate",
+    # 事件新聞
+    "新聞", "消息", "事件", "發生", "怎麼了", "為什麼跌", "為什麼漲",
+    # 加密貨幣即時
+    "btc", "eth", "sol", "bnb", "xrp", "doge", "比特幣", "以太幣",
+]
+
+def _needs_search(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in SEARCH_KEYWORDS)
+
+async def web_search(query: str, max_results: int = 5) -> str:
+    """Search DuckDuckGo and return formatted results."""
+    try:
+        from duckduckgo_search import DDGS
+        results = await asyncio.to_thread(
+            lambda: list(DDGS().text(query, max_results=max_results, region="tw-tzh"))
+        )
+        if not results:
+            return ""
+        lines = [f"【網路搜尋結果 for: {query}】"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r.get('title','')}\n   {r.get('body','')}\n   來源: {r.get('href','')}")
+        return "\n\n".join(lines)
+    except Exception as e:
+        return ""
+
 NEWS_FEEDS = [
     ("CoinTelegraph", "https://cointelegraph.com/rss"),
     ("CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),

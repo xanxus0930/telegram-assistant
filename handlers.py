@@ -52,6 +52,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"嗨 {name}！我是你的個人 AI 助理 🤖\n\n"
         "功能：\n"
         "• 💬 對話（記憶上下文）\n"
+        "• 🔍 自動網路搜尋（即時資訊）\n"
         "• 🖼️ 圖片分析\n"
         "• 🎤 語音轉文字\n"
         "• 🔗 網頁自動摘要\n"
@@ -536,6 +537,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content = await utils.fetch_webpage(url)
         if content:
             user_text = f"請摘要這個網頁：{url}\n\n內容：\n{content}"
+        await status.delete()
+
+    # Auto web search for queries needing fresh information
+    elif utils._needs_search(user_text):
+        status = await update.message.reply_text("🌐 搜尋最新資訊中...")
+        search_results = await utils.web_search(user_text)
+        if search_results:
+            user_text = f"{user_text}\n\n{search_results}\n\n請根據以上搜尋結果回答，並標明資訊來源。"
         await status.delete()
 
     history, persona = await _get_context(user_id)
