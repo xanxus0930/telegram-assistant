@@ -1,11 +1,15 @@
 import asyncio
+import ipaddress
 import re
+import socket
 from datetime import datetime, timedelta, time as dt_time
+from urllib.parse import urlparse
 
 import aiohttp
 import feedparser
 import pytz
 from bs4 import BeautifulSoup
+from yarl import URL
 
 # ── Web Search (DuckDuckGo) ───────────────────────────────────────────────────
 
@@ -79,14 +83,72 @@ def extract_urls(text: str) -> list[str]:
     return URL_PATTERN.findall(text)
 
 
+MAX_REDIRECTS = 3
+FETCH_LIMIT_BYTES = 2_000_000
+
+
+def _resolves_to_public_ip(hostname: str, port: int) -> bool:
+    """Every resolved address must be public; reject if any is internal."""
+    try:
+        infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def _is_safe_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    try:
+        hostname = p.hostname
+        port = p.port or (443 if p.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    return _resolves_to_public_ip(hostname, port)
+
+
 async def fetch_webpage(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
+            current = url
+            for _ in range(MAX_REDIRECTS + 1):
+                if not _is_safe_url(current):
                     return ""
-                html = await resp.text()
+                async with session.get(
+                    current,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            return ""
+                        current = str(resp.url.join(URL(location)))
+                        continue
+                    if resp.status != 200:
+                        return ""
+                    html = await resp.content.read(FETCH_LIMIT_BYTES)
+                    break
+            else:
+                return ""
 
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):

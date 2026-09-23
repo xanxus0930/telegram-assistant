@@ -1,3 +1,4 @@
+import html
 import logging
 import os
 import tempfile
@@ -447,7 +448,7 @@ async def _build_news_text(user_id: int, articles: list[dict]) -> str:
         lines = ["📰 <b>加密貨幣最新新聞</b>\n"]
         for a in articles[:10]:
             title = utils.escape_html(a["title"])
-            lines.append(f'• <a href="{a["url"]}">{title}</a>\n  <i>{a["source"]}</i>')
+            lines.append(f'• <a href="{html.escape(a["url"], quote=True)}">{title}</a>\n  <i>{a["source"]}</i>')
         return "\n\n".join(lines)
 
 
